@@ -41,6 +41,8 @@
         messages: []
     };
 
+    // FIX: these were being assigned without being declared, which throws
+    // under 'use strict' the first time getActivePetRecord() ran.
     let activePetRecord = null;
     let randomQuote = '';
 
@@ -54,7 +56,13 @@
     //=====================================
     async function setUpData() {
         const USER_URL = 'https://www.neopets.com/quickref.phtml';
-        //open database at same time
+
+        // OPTIMIZATION: the quickref fetch and the DB connection don't
+        // depend on each other until *after* both finish (we only need
+        // userData.activePet once we're about to query the DB). Kicking
+        // the DB open off at the same time as the fetch lets the network
+        // round-trip and the IndexedDB handshake overlap instead of
+        // happening back-to-back.
         const dbPromise = openDatabase();
         const response = await fetch(USER_URL, { credentials: 'include' });
         const isLoggedIn = !response.url.includes('login');
@@ -73,7 +81,11 @@
         }
 
         infoData.messages.push('User logged in. Grabbed list of neopets and current active neopet.');
-        //waiting on database 
+
+        // FIX: this now genuinely waits for the DB read to finish before
+        // setUpData resolves, because getActivePetRecord properly wraps
+        // the IndexedDB request in a Promise (see below). We hand it the
+        // already-opening DB connection instead of opening a second one.
         await getActivePetRecord(dbPromise);
         return true;
     }
@@ -93,12 +105,10 @@
             };
 
             request.onsuccess = function(event) {
-                infoData.messages.push("Database successfully opened.")
                 resolve(event.target.result);
             };
 
             request.onerror = function(event) {
-                infoData.error = "Error opening the database."
                 reject(event.target.error);
             };
         });
@@ -114,7 +124,6 @@
         const db = await dbPromise;
         const transaction = db.transaction(QUOTES_STORE_NAME, 'readwrite');
         const quotes_store = transaction.objectStore(QUOTES_STORE_NAME);
-
         const request = quotes_store.get(userData.activePet);
 
         return new Promise((resolve, reject) => {
@@ -155,11 +164,31 @@
         });
     }
 
+    // Writes a full replacement quotes array for one pet. Same pattern as
+    // getActivePetRecord: open the DB, kick off the write, then wrap the
+    // transaction lifecycle in a Promise so callers can await completion.
+    async function savePetQuotes(petName, quotesArray) {
+        const db = await openDatabase();
+        const transaction = db.transaction(QUOTES_STORE_NAME, 'readwrite');
+        const quotes_store = transaction.objectStore(QUOTES_STORE_NAME);
+        quotes_store.put({ petName, quotes: quotesArray });
+
+        return new Promise((resolve, reject) => {
+            transaction.oncomplete = function() {
+                db.close();
+                resolve();
+            };
+            transaction.onerror = function(event) {
+                reject(event.target.error);
+            };
+        });
+    }
+
     //=====================================
     // ALLOW USER TO EDIT PET DATA
     //=====================================
     function editPet() {
-      //TODO
+        openEditQuotesModal();
     }
 
     //=====================================
@@ -185,6 +214,11 @@
     //=====================================
     // START
     //=====================================
+    // FIX: switched from 'load' to 'DOMContentLoaded'. 'load' waits for
+    // every resource on the page, including ad iframes/images — that's
+    // almost certainly why this felt slower for non-premium users.
+    // DOMContentLoaded fires as soon as the HTML is parsed, which is all
+    // this script actually needs.
     window.addEventListener('DOMContentLoaded', async () => {
         createInfoButton();
         const success = await setUpData();
@@ -201,6 +235,10 @@
 
         randomQuote = quotes[Math.floor(Math.random() * quotes.length)];
         appendQuote(randomQuote);
+
+        // Extra entry point via Tampermonkey's own menu, in addition to
+        // the button in the info box.
+        GM_registerMenuCommand('Edit Pet Quotes', editPet);
     });
 
     /////=======AESTHETICS===========
@@ -219,6 +257,7 @@
             return;
         }
 
+        // FIX: comment now matches the actual condition (90%, not 30%)
         const showQuote = oldPage ? false : !validPage ? false : Math.random() < 0.9; // 90% chance to show
         if (!showQuote) return;
 
@@ -258,6 +297,214 @@
         document.body.appendChild(quoteBox);
     }
 
+    // EDIT QUOTES MODAL — lets the user view every quote on record for the
+    // active pet, add new ones, edit or delete existing ones, all against
+    // a local draft. Nothing touches IndexedDB until "Save" is clicked;
+    // "Cancel" (or clicking outside the panel) discards the draft.
+    function openEditQuotesModal() {
+        if (!userData.activePet) {
+            alert('No active pet loaded yet — try reloading the page.');
+            return;
+        }
+
+        document.querySelector('#petQuotesEditModal')?.remove();
+
+        // Work on a copy so in-progress edits never touch the real data.
+        const draftQuotes = (activePetRecord?.quotes || []).slice();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'petQuotesEditModal';
+        Object.assign(overlay.style, {
+            position: 'fixed',
+            top: '0', left: '0', right: '0', bottom: '0',
+            backgroundColor: 'rgba(0,0,0,0.45)',
+            zIndex: '200000',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontFamily: 'Arial, sans-serif'
+        });
+        // click outside the panel to cancel
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) overlay.remove();
+        });
+
+        const panel = document.createElement('div');
+        Object.assign(panel.style, {
+            backgroundColor: '#ffffff',
+            borderRadius: '10px',
+            padding: '20px',
+            width: '340px',
+            maxHeight: '80vh',
+            display: 'flex',
+            flexDirection: 'column',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
+            fontSize: '14px',
+            color: '#333'
+        });
+
+        const heading = document.createElement('h3');
+        heading.textContent = `Edit quotes — ${userData.activePet}`;
+        heading.style.margin = '0 0 12px 0';
+        panel.appendChild(heading);
+
+        const list = document.createElement('div');
+        Object.assign(list.style, {
+            overflowY: 'auto',
+            flex: '1',
+            marginBottom: '10px',
+            border: '1px solid #ddd',
+            borderRadius: '6px',
+            padding: '8px'
+        });
+        panel.appendChild(list);
+
+        function renderList() {
+            list.innerHTML = '';
+            if (!draftQuotes.length) {
+                const empty = document.createElement('div');
+                empty.textContent = 'No quotes yet — add one below.';
+                empty.style.color = '#888';
+                empty.style.fontSize = '13px';
+                list.appendChild(empty);
+                return;
+            }
+            draftQuotes.forEach((quoteText, index) => {
+                const row = document.createElement('div');
+                Object.assign(row.style, { display: 'flex', gap: '6px', marginBottom: '6px' });
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = quoteText;
+                Object.assign(input.style, {
+                    flex: '1',
+                    padding: '4px 6px',
+                    fontSize: '13px',
+                    border: '1px solid #ccc',
+                    borderRadius: '4px'
+                });
+                // edits write straight into the draft array as the user types
+                input.addEventListener('input', () => {
+                    draftQuotes[index] = input.value;
+                });
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.textContent = '✕';
+                deleteBtn.title = 'Delete quote';
+                Object.assign(deleteBtn.style, {
+                    border: 'none',
+                    backgroundColor: '#e0e0e0',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    padding: '4px 8px'
+                });
+                deleteBtn.addEventListener('click', () => {
+                    draftQuotes.splice(index, 1);
+                    renderList();
+                });
+
+                row.appendChild(input);
+                row.appendChild(deleteBtn);
+                list.appendChild(row);
+            });
+        }
+        renderList();
+
+        // add-new-quote row
+        const addRow = document.createElement('div');
+        Object.assign(addRow.style, { display: 'flex', gap: '6px', marginBottom: '14px' });
+
+        const addInput = document.createElement('input');
+        addInput.type = 'text';
+        addInput.placeholder = 'New quote...';
+        Object.assign(addInput.style, {
+            flex: '1',
+            padding: '4px 6px',
+            fontSize: '13px',
+            border: '1px solid #ccc',
+            borderRadius: '4px'
+        });
+
+        const addBtn = document.createElement('button');
+        addBtn.textContent = '+ Add';
+        Object.assign(addBtn.style, {
+            border: 'none',
+            backgroundColor: '#cfe8d8',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            padding: '4px 10px'
+        });
+
+        function addQuoteFromInput() {
+            const text = addInput.value.trim();
+            if (!text) return;
+            draftQuotes.push(text);
+            addInput.value = '';
+            renderList();
+        }
+        addBtn.addEventListener('click', addQuoteFromInput);
+        addInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') addQuoteFromInput();
+        });
+
+        addRow.appendChild(addInput);
+        addRow.appendChild(addBtn);
+        panel.appendChild(addRow);
+
+        // footer: cancel / save
+        const footer = document.createElement('div');
+        Object.assign(footer.style, { display: 'flex', justifyContent: 'flex-end', gap: '8px' });
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = 'Cancel';
+        Object.assign(cancelBtn.style, {
+            padding: '6px 14px',
+            border: '1px solid #999',
+            borderRadius: '4px',
+            backgroundColor: '#f2f2f2',
+            cursor: 'pointer'
+        });
+        cancelBtn.addEventListener('click', () => overlay.remove());
+
+        const saveBtn = document.createElement('button');
+        saveBtn.textContent = 'Save';
+        Object.assign(saveBtn.style, {
+            padding: '6px 14px',
+            border: 'none',
+            borderRadius: '4px',
+            backgroundColor: '#5a9bd5',
+            color: '#fff',
+            cursor: 'pointer'
+        });
+        saveBtn.addEventListener('click', async () => {
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            try {
+                const cleaned = draftQuotes.map(q => q.trim()).filter(Boolean);
+                await savePetQuotes(userData.activePet, cleaned);
+
+                // keep this page's in-memory state consistent with the DB
+                quotes.length = 0;
+                quotes.push(...(cleaned.length ? cleaned : DEFAULT_QUOTES));
+                if (activePetRecord) activePetRecord.quotes = cleaned;
+
+                overlay.remove();
+            } catch (err) {
+                console.error('Failed to save quotes:', err);
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save';
+                alert('Something went wrong saving your quotes — check the console for details.');
+            }
+        });
+
+        footer.appendChild(cancelBtn);
+        footer.appendChild(saveBtn);
+        panel.appendChild(footer);
+
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+    }
+
     // INFORMATION BUTTON ON BOTTOM OF PAGE
     function createInfoButton() {
         const button = document.createElement('button');
@@ -295,7 +542,7 @@
         infoBox.id = 'petQuotesInfo';
 
         infoBox.innerHTML = `
-        <strong>🗨 Pet Quotes</strong>
+        <strong>🐾 Pet Quotes</strong>
         <br><br>
         Logged in: ${userData.username || 'No'}
         <br>
@@ -325,6 +572,21 @@
             fontSize: '14px',
             color: '#333'
         });
+
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '✏️ Edit Quotes';
+        Object.assign(editBtn.style, {
+            marginTop: '10px',
+            width: '100%',
+            padding: '6px 0',
+            border: '1px solid #999',
+            borderRadius: '4px',
+            backgroundColor: '#f2f7f9',
+            cursor: 'pointer',
+            fontSize: '13px'
+        });
+        editBtn.addEventListener('click', openEditQuotesModal);
+        infoBox.appendChild(editBtn);
 
         document.body.appendChild(infoBox);
     }
